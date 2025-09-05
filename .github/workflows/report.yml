@@ -1,0 +1,39 @@
+name: Wildberries Report Bot
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # ⏱️ каждые 2 часа
+  workflow_dispatch:
+
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🧬 Checkout репозитория
+        uses: actions/checkout@v3
+
+      - name: 🐍 Установка Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 📁 Распаковка GOOGLE_CREDS_B64 → JSON
+        run: |
+          mkdir -p creds
+          echo "${{ secrets.GOOGLE_CREDS_B64 }}" | base64 --decode > creds/service_account.json
+
+
+      - name: 🚀 Запуск Python-скрипта
+        env:
+          SOURCE_SHEET_ID: ${{ secrets.SOURCE_SHEET_ID }}
+          TARGET_SHEET_ID: ${{ secrets.TARGET_SHEET_ID }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+        run: python main.py
+
