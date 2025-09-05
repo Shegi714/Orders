@@ -4,159 +4,96 @@ import requests
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from oauth2client.service_account import ServiceAccountCredentials
-from io import StringIO
+from datetime import datetime, timedelta
 
 # 🧪 Глобальные переменные окружения (используются GitHub Secrets)
 SOURCE_SHEET_ID = os.environ.get("SOURCE_SHEET_ID")
 TARGET_SHEET_ID = os.environ.get("TARGET_SHEET_ID")
-GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH")
 
-# ⚙️ Настройки подключения к Google Sheets
+# ⚙️ Подключение к Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_json = os.environ.get("GOOGLE_CREDS_JSON")
 if not creds_json:
     raise ValueError("GOOGLE_CREDS_JSON not set or empty!")
 
-# 🧠 Преобразуем в файл-like объект
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# 📑 Чтение данных токенов и кабинетов
+# 📑 Чтение токенов и кабинетов
 source_sheet = client.open_by_key(SOURCE_SHEET_ID).sheet1
 rows = source_sheet.get_all_values()[1:]
 data = [{"token": row[0], "cabinet": row[1]} for row in rows if len(row) >= 2 and row[0].strip()]
 
-
-# 📡 Параметры отчета
-params = {
-    "locale": "ru",
-    "groupByBrand": "false",
-    "groupBySubject": "false",
-    "groupBySa": "true",
-    "groupByNm": "true",
-    "groupByBarcode": "true",
-    "groupBySize": "true",
-    "filterPics": "0",
-    "filterVolume": "0"
-}
-
-# 🔁 Ретрий создания отчета
-def create_report(token, cabinet_name, retries=3, delay=5):
-    url = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
+# 📡 Функция для выгрузки заказов за последние N дней
+def fetch_orders(token, days=14):
+    url = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
     headers = {
         "accept": "application/json",
-        "Authorization": f"Bearer {token}",
+        "Authorization": token,  # ⚠️ тут НЕ "Bearer", а просто токен
         "User-Agent": "Mozilla/5.0"
     }
 
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"📡 [{attempt}/{retries}] Создание отчета для {cabinet_name}...")
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+    date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+    all_orders = []
+    next_date_from = date_from
 
-            if response.status_code == 401:
-                print(f"❌ Токен для {cabinet_name} нерабочий (401 Unauthorized). Пропускаем без повторов.")
-                return None
+    while True:
+        print(f"📡 Запрос заказов c {next_date_from} ...")
+        params = {"dateFrom": next_date_from}
+        response = requests.get(url, headers=headers, params=params, timeout=60)
 
-            response.raise_for_status()
+        if response.status_code == 401:
+            print("❌ Неверный токен или нет доступа (401 Unauthorized).")
+            break
+        if response.status_code != 200:
+            print(f"⚠️ Ошибка запроса {response.status_code}: {response.text}")
+            break
 
-            data = response.json()
-            task_id = data.get("data", {}).get("taskId") or data.get("taskId")
-            if task_id:
-                print(f"✅ Получен taskId: {task_id}")
-                return task_id
-            else:
-                print(f"⚠️ Нет taskId в ответе: {data}")
+        orders = response.json()
+        if not orders:
+            print("✅ Данные закончились, все заказы собраны.")
+            break
 
-        except Exception as e:
-            print(f"⚠️ Ошибка при создании отчета для {cabinet_name}: {e}")
+        all_orders.extend(orders)
+        print(f"📦 Получено заказов: {len(orders)}, всего собрано: {len(all_orders)}")
 
-        time.sleep(delay)
+        # Готовим дату для следующего запроса
+        next_date_from = orders[-1]["lastChangeDate"]
 
-    print(f"❌ Превышено количество попыток для {cabinet_name}.")
-    return None
+        # Лимит 1 запрос/мин
+        print("⏳ Ждём 60 секунд...")
+        time.sleep(60)
 
-
-# ⏳ Проверка готовности отчета (до 5 попыток)
-def wait_for_report(token, task_id, cabinet_name, retries=20, delay=15):
-    url = f"https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{task_id}/download"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    print(f"⏳ Ждём 10 секунд перед первой проверкой taskId для кабинета {cabinet_name}...")
-    time.sleep(delay)  # 💥 Принудительная первая задержка
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"🔁 [{attempt}/{retries}] Проверка готовности отчета для {cabinet_name}...")
-            response = requests.get(url, headers=headers, timeout=30)
-
-            if response.status_code == 200:
-                print(f"✅ Отчет для {cabinet_name} готов.")
-                return response.json()
-
-            elif response.status_code == 401:
-                print(f"❌ Токен для {cabinet_name} нерабочий (401 Unauthorized).")
-                return None
-
-            elif response.status_code == 429:
-                print(f"⚠️ Слишком много запросов (429). Ждём {delay}s...")
-
-            elif response.status_code == 404:
-                print(f"ℹ️ Отчет ещё не готов (404). Ждём...")
-
-            else:
-                print(f"❗ Неожиданный код ответа {response.status_code}: {response.text}")
-
-        except Exception as e:
-            print(f"⚠️ Ошибка при проверке отчета для {cabinet_name}: {e}")
-
-        time.sleep(delay)
-
-    print(f"❌ Превышено количество попыток для {cabinet_name}. Отчет не получен.")
-    return None
+    return all_orders
 
 
-# 📊 Запись отчета в Google Sheets
-from datetime import datetime
-
-def write_report_to_sheet(sheet_obj, cabinet_name, report_data):
+# 📊 Запись заказов в Google Sheets
+def write_orders_to_sheet(sheet_obj, cabinet_name, orders):
     try:
-        today = datetime.now().strftime("%d-%m-%Y")
-
+        # Создаём или очищаем лист
         try:
             worksheet = sheet_obj.worksheet(cabinet_name)
             worksheet.clear()
         except gspread.exceptions.WorksheetNotFound:
-            worksheet = sheet_obj.add_worksheet(title=cabinet_name, rows="1000", cols="10")
+            worksheet = sheet_obj.add_worksheet(title=cabinet_name, rows="1000", cols="20")
 
-        # Заголовки
-        headers = ["Дата", "nmId", "barcode", "", "", "В пути до получателей", "В пути возвраты на склад WB", "Всего находится на складах"]
+        if not orders:
+            worksheet.update([["Нет данных за выбранный период"]])
+            print(f"⚠️ Данных для '{cabinet_name}' нет.")
+            return
+
+        # Заголовки в том порядке, в котором они пришли
+        headers = list(orders[0].keys())
         rows = [headers]
 
-        for item in report_data:
-            nm_id = item.get("nmId", "")
-            barcode = item.get("barcode", "")
-            warehouses = {w["warehouseName"]: w["quantity"] for w in item.get("warehouses", [])}
-
-            row = [
-                today,
-                nm_id,
-                barcode,
-                "", "",  # D, E — пропущены по ТЗ
-                warehouses.get("В пути до получателей", 0),
-                warehouses.get("В пути возвраты на склад WB", 0),
-                warehouses.get("Всего находится на складах", 0)
-            ]
+        for order in orders:
+            row = [order.get(h, "") for h in headers]
             rows.append(row)
 
+        # Обновляем таблицу одним запросом
         worksheet.update(rows)
-        print(f"✅ Сохранено в лист '{cabinet_name}'")
+        print(f"✅ Сохранено {len(orders)} заказов в лист '{cabinet_name}'")
 
     except Exception as e:
         print(f"🛑 Ошибка при записи в лист '{cabinet_name}': {e}")
@@ -171,17 +108,9 @@ def main():
         token = entry["token"]
         print(f"\n🔄 Работаем с кабинетом: {cabinet}")
 
-        task_id = create_report(token, cabinet)
-        if not task_id:
-            print(f"❌ Пропуск {cabinet}, не удалось создать отчет.")
-            continue
+        orders = fetch_orders(token, days=14)
+        write_orders_to_sheet(target_sheet, cabinet, orders)
 
-        report = wait_for_report(token, task_id, cabinet)
-        if not report:
-            print(f"❌ Пропуск {cabinet}, отчет не готов.")
-            continue
-
-        write_report_to_sheet(target_sheet, cabinet, report)
 
 if __name__ == "__main__":
     main()
