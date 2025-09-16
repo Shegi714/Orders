@@ -30,42 +30,112 @@ def fetch_orders(token, days=14):
     url = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
     headers = {
         "accept": "application/json",
-        "Authorization": token,  # ⚠️ тут НЕ "Bearer", а просто токен
-        "User-Agent": "Mozilla/5.0"
+        "Authorization": token,  # для WB statistics-api — без Bearer
+        "User-Agent": "Mozilla/5.0 (compatible; WBFetcher/1.0; +https://github.com/yourrepo)"
     }
 
     date_from = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
-    all_orders = []
+    all_rows = []
     next_date_from = date_from
+    page = 1
+
+    # настройки повторов
+    max_decode_retries = 3          # повторов при пустом/не-JSON ответе с 200
+    base_sleep = 60                 # базовая пауза для лимита (1 req/min)
+    max_http_retries = 3            # повторов при 429/5xx
 
     while True:
-        print(f"📡 Запрос заказов c {next_date_from} ...")
-        params = {"dateFrom": next_date_from}
-        response = requests.get(url, headers=headers, params=params, timeout=60)
+        attempt = 0
+        while True:
+            attempt += 1
+            print(f"📡 [{page}] Запрос заказов: dateFrom={next_date_from} (попытка {attempt})")
+            try:
+                resp = requests.get(url, headers=headers, params={"dateFrom": next_date_from}, timeout=60)
+            except Exception as e:
+                print(f"❌ Ошибка сети: {e} — ждём {base_sleep}s и повторим.")
+                time.sleep(base_sleep)
+                if attempt >= max_http_retries:
+                    print("🛑 Превышены повторы сети. Останавливаемся.")
+                    return all_rows
+                continue
 
-        if response.status_code == 401:
-            print("❌ Неверный токен или нет доступа (401 Unauthorized).")
+            # хэндлинг лимитов/временных ошибок
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = base_sleep * min(attempt, 4)
+                print(f"⚠️ HTTP {resp.status_code}. Ждём {wait}s и повторяем ту же страницу. Фрагмент: {resp.text[:200]}")
+                time.sleep(wait)
+                if attempt >= max_http_retries:
+                    print("🛑 Превышены повторы при 429/5xx. Останавливаемся.")
+                    return all_rows
+                continue
+
+            if resp.status_code == 401:
+                print("❌ 401 Unauthorized — токен не подходит к statistics-api. Пропускаем кабинет.")
+                return all_rows
+
+            if resp.status_code != 200:
+                print(f"⚠️ Неожиданный код {resp.status_code}. Тело (фрагмент): {resp.text[:300]}")
+                # на всякий случай не двигаем dateFrom и пробуем повтор
+                time.sleep(base_sleep)
+                if attempt >= max_http_retries:
+                    print("🛑 Превышены повторы при не-200. Останавливаемся.")
+                    return all_rows
+                continue
+
+            # Проверим, что это JSON и не пустое тело
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            body = resp.text or ""
+            if ("application/json" not in ctype) or (not body.strip()):
+                # бывает HTML-страница WAF с 200
+                print(f"⚠️ Ожидали JSON, получили Content-Type='{ctype}', len={len(body)}. Фрагмент: {body[:200]}")
+                time.sleep(base_sleep)
+                if attempt >= max_decode_retries:
+                    print("🛑 Превышены повторы декодирования JSON. Останавливаемся.")
+                    return all_rows
+                continue
+
+            # Попробуем распарсить JSON
+            try:
+                chunk = resp.json()
+            except Exception as e:
+                print(f"⚠️ JSONDecodeError: {e}. Фрагмент тела: {body[:200]}")
+                time.sleep(base_sleep)
+                if attempt >= max_decode_retries:
+                    print("🛑 Превышены повторы декодирования JSON. Останавливаемся.")
+                    return all_rows
+                continue
+
+            if not isinstance(chunk, list):
+                print(f"⚠️ Ожидали массив, получили {type(chunk)}. Фрагмент: {str(chunk)[:200]}")
+                time.sleep(base_sleep)
+                if attempt >= max_decode_retries:
+                    print("🛑 Превышены повторы из-за неверного формата. Останавливаемся.")
+                    return all_rows
+                continue
+
+            # валидный ответ — выходим из внутреннего цикла попыток
             break
-        if response.status_code != 200:
-            print(f"⚠️ Ошибка запроса {response.status_code}: {response.text}")
+
+        if not chunk:
+            print("✅ Данные закончились, все записи собраны.")
             break
 
-        orders = response.json()
-        if not orders:
-            print("✅ Данные закончились, все заказы собраны.")
+        all_rows.extend(chunk)
+        print(f"📦 Получено записей: {len(chunk)}, всего: {len(all_rows)}")
+
+        # Подготовим следующий dateFrom
+        try:
+            next_date_from = chunk[-1]["lastChangeDate"]
+        except Exception:
+            print("⚠️ В последней записи нет lastChangeDate — остановка пагинации.")
             break
 
-        all_orders.extend(orders)
-        print(f"📦 Получено заказов: {len(orders)}, всего собрано: {len(all_orders)}")
+        page += 1
+        # соблюдаем лимит
+        print(f"⏳ Пауза {base_sleep}s (лимит API 1 req/min)...")
+        time.sleep(base_sleep)
 
-        # Готовим дату для следующего запроса
-        next_date_from = orders[-1]["lastChangeDate"]
-
-        # Лимит 1 запрос/мин
-        print("⏳ Ждём 60 секунд...")
-        time.sleep(60)
-
-    return all_orders
+    return all_rows
 
 
 # 📊 Запись заказов в Google Sheets
